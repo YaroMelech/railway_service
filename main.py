@@ -10,16 +10,18 @@ def now_iso() -> str:
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from telethon import TelegramClient
-from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
+from telethon.tl.functions.contacts import AddContactRequest, DeleteContactsRequest
 from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantsRequest
+from telethon.tl.functions.messages import AddChatUserRequest
 from telethon.tl.types import (
     InputPhoneContact, InputUser, ChannelParticipantsSearch,
     UserStatusRecently, UserStatusOnline, UserStatusLastWeek,
-    InputPeerChannel
+    InputPeerChannel, Chat, Channel
 )
 from telethon.errors import (
     FloodWaitError, PeerFloodError, ChatAdminRequiredError,
     UserPrivacyRestrictedError, UserNotMutualContactError,
+    UserAlreadyParticipantError, UserChannelsTooMuchError,
     ChatWriteForbiddenError, SessionPasswordNeededError,
     PhoneCodeInvalidError, PhoneCodeExpiredError
 )
@@ -84,13 +86,13 @@ def _init_session_dirs() -> tuple[Path, list[Path]]:
 SESSION_DIR, ALL_SESSION_DIRS = _init_session_dirs()
 log.info(f"Initialized SESSION_DIR: {SESSION_DIR} (all search dirs: {[str(d) for d in ALL_SESSION_DIRS]})")
 
-# Anti-limit configuration
-MIN_DELAY = float(os.environ.get("MIN_DELAY", "30"))
-MAX_DELAY = float(os.environ.get("MAX_DELAY", "120"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
-BATCH_PAUSE_MIN = float(os.environ.get("BATCH_PAUSE_MIN", "300"))
-BATCH_PAUSE_MAX = float(os.environ.get("BATCH_PAUSE_MAX", "600"))
-ROTATION_THRESHOLD = int(os.environ.get("ROTATION_THRESHOLD", "20"))
+# Anti-limit configuration (fast adding: 3s delay)
+MIN_DELAY = float(os.environ.get("MIN_DELAY", "3.0"))
+MAX_DELAY = float(os.environ.get("MAX_DELAY", "3.0"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "30"))
+BATCH_PAUSE_MIN = float(os.environ.get("BATCH_PAUSE_MIN", "8"))
+BATCH_PAUSE_MAX = float(os.environ.get("BATCH_PAUSE_MAX", "12"))
+ROTATION_THRESHOLD = int(os.environ.get("ROTATION_THRESHOLD", "30"))
 
 app = FastAPI()
 
@@ -261,24 +263,29 @@ def add_job_log(job: Optional[dict], level: str, message: str):
         job["logs"] = job["logs"][-250:]
 
 
-async def human_delay(job: Optional[dict] = None, min_s: float = MIN_DELAY, max_s: float = MAX_DELAY):
-    delay = random.uniform(min_s, max_s)
-    jitter = random.uniform(-2, 5)
-    delay = max(8, delay + jitter)
-    msg = f"Human delay: waiting {delay:.1f}s before next operation..."
+async def human_delay(job: Optional[dict] = None, delay_s: float = 3.0):
+    msg = f"Delay: waiting {delay_s:.1f}s before next addition..."
     log.info(msg)
     if job:
         add_job_log(job, "delay", msg)
-    await asyncio.sleep(delay)
+    await asyncio.sleep(delay_s)
 
 
 async def batch_pause(job: Optional[dict] = None):
     pause = random.uniform(BATCH_PAUSE_MIN, BATCH_PAUSE_MAX)
-    msg = f"Batch pause safety threshold reached: cooling down for {pause:.0f}s..."
+    msg = f"Batch safety pause: cooling down for {pause:.0f}s..."
     log.info(msg)
     if job:
         add_job_log(job, "delay", msg)
     await asyncio.sleep(pause)
+
+
+async def _add_user_to_group(client: TelegramClient, entity, input_user):
+    """Directly adds a user to a basic Chat or supergroup/Channel without sending invitation links."""
+    if isinstance(entity, Chat):
+        return await client(AddChatUserRequest(chat_id=entity.id, user_id=input_user, fwd_limit=100))
+    else:
+        return await client(InviteToChannelRequest(channel=entity, users=[input_user]))
 
 
 @app.get("/")
@@ -750,10 +757,10 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                 return
 
             member_label = f"@{member['username']}" if member.get("username") else f"{member.get('first_name', '')} {member.get('last_name', '')} (ID: {member.get('id')})".strip()
-            add_job_log(job, "info", f"[{i + 1}/{len(members)}] Inviting {member_label}...")
+            add_job_log(job, "info", f"[{i + 1}/{len(members)}] Directly adding {member_label} to group...")
 
             try:
-                # Strategy 4: Use ID + AccessHash for direct matching
+                # Use ID + AccessHash for direct matching
                 access_hash = int(member.get("access_hash", 0))
                 user_id_tg = int(member["id"])
 
@@ -762,55 +769,73 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                 else:
                     input_user = await client.get_input_entity(member.get("username") or user_id_tg)
 
-                # Strategy 1 & 2: Contact-add trick with human delays
-                contact = InputPhoneContact(
-                    client_id=random.randint(100000, 999999),
-                    phone=f"+{random.randint(1000000000, 9999999999)}",
-                    first_name=member.get("first_name", "User") or "User",
-                    last_name=member.get("last_name", "") or ""
-                )
-
-                # Try direct invite first (uses AccessHash — lower friction)
+                # Step 1: Attempt direct group addition (no invitation link)
                 try:
-                    await client(InviteToChannelRequest(channel=entity, users=[input_user]))
+                    await _add_user_to_group(client, entity, input_user)
                     added_count += 1
                     job["added"] = added_count
-                    add_job_log(job, "success", f"Successfully added {member_label} directly! (Total added: {added_count})")
-                except (UserNotMutualContactError, UserPrivacyRestrictedError):
-                    # Fall back to contact-add trick
-                    add_job_log(job, "warn", f"{member_label} has privacy restrictions. Attempting contact bypass...")
+                    add_job_log(job, "success", f"Directly added {member_label} to group! ({added_count}/{len(members)})")
+                except (UserPrivacyRestrictedError, UserNotMutualContactError):
+                    # Step 2: User has privacy restriction -> add to contacts list first, add to group, then delete from contacts!
+                    add_job_log(job, "warn", f"{member_label} has privacy restrictions. Adding to account contacts first...")
+                    contact_saved = False
                     try:
-                        import_result = await client(ImportContactsRequest([contact]))
-                        if import_result.imported:
-                            imported_user = import_result.users[0]
-                            await client(InviteToChannelRequest(channel=entity, users=[imported_user]))
-                            await client(DeleteContactsRequest(id=[imported_user]))
-                            added_count += 1
-                            job["added"] = added_count
-                            add_job_log(job, "success", f"Successfully added {member_label} via contact bypass! (Total added: {added_count})")
-                        else:
-                            job["skipped"] += 1
-                            add_job_log(job, "warn", f"Skipped {member_label}: privacy settings prohibit group invites.")
-                    except Exception as exc:
+                        first_name = member.get("first_name", "User") or "User"
+                        last_name = member.get("last_name", "") or ""
+                        await client(AddContactRequest(
+                            id=input_user,
+                            first_name=first_name,
+                            last_name=last_name,
+                            phone="",
+                            add_phone_privacy_exception=False
+                        ))
+                        contact_saved = True
+                        add_job_log(job, "info", f"Saved {member_label} to contacts. Retrying direct addition from contacts...")
+                        await asyncio.sleep(0.5)
+
+                        # Directly add from contacts
+                        await _add_user_to_group(client, entity, input_user)
+                        added_count += 1
+                        job["added"] = added_count
+                        add_job_log(job, "success", f"Successfully added {member_label} via contacts list! ({added_count}/{len(members)})")
+                    except (UserPrivacyRestrictedError, UserNotMutualContactError):
                         job["skipped"] += 1
-                        add_job_log(job, "warn", f"Skipped {member_label}: {str(exc)[:120]}")
+                        add_job_log(job, "warn", f"Skipped {member_label}: user settings disallow additions even from contacts.")
+                    except Exception as contact_err:
+                        job["skipped"] += 1
+                        add_job_log(job, "warn", f"Could not add {member_label} via contacts: {str(contact_err)[:120]}")
+                    finally:
+                        # Clean up: Always remove from contacts list after attempt!
+                        if contact_saved:
+                            try:
+                                await client(DeleteContactsRequest(id=[input_user]))
+                                add_job_log(job, "info", f"Removed {member_label} from account contacts.")
+                            except Exception as del_err:
+                                log.warning(f"Could not remove contact {member_label}: {del_err}")
+
+                except UserAlreadyParticipantError:
+                    job["skipped"] += 1
+                    add_job_log(job, "info", f"Skipped {member_label}: already a member of this group.")
+                except UserChannelsTooMuchError:
+                    job["skipped"] += 1
+                    add_job_log(job, "warn", f"Skipped {member_label}: user has reached Telegram channel limit (500).")
                 except ChatWriteForbiddenError:
                     job["status"] = "failed"
-                    job["error"] = "Cannot write to this group. Check admin permissions."
+                    job["error"] = "Cannot write or add members to this group. Check admin rights."
                     job["completed_at"] = now_iso()
-                    add_job_log(job, "error", "Fatal error: Admin permissions required to invite members to this group.")
+                    add_job_log(job, "error", "Fatal error: Admin permissions required to add members to this group.")
                     return
 
                 adds_since_pause += 1
                 job["progress"] = i + 1
 
-                # Strategy 1: Rotation threshold — stop and signal rotation needed
+                # Rotation threshold
                 if adds_since_pause >= ROTATION_THRESHOLD:
                     await batch_pause(job)
                     adds_since_pause = 0
 
-                # Strategy 2: Human-like micro-delay with jitter
-                await human_delay(job)
+                # Fast adding delay (3 seconds)
+                await human_delay(job, delay_s=3.0)
 
             except PeerFloodError as e:
                 job["status"] = "failed"
