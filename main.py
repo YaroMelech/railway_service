@@ -101,6 +101,11 @@ async def batch_pause():
     await asyncio.sleep(pause)
 
 
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "relay-telegram"}
+
+
 @app.post("/v1/health")
 async def health(request: Request):
     verify_key(request)
