@@ -26,7 +26,7 @@ log = logging.getLogger("relay")
 SERVICE_KEY = os.environ.get("SERVICE_KEY", "change-me-in-production")
 API_ID = int(os.environ.get("API_ID", "2040"))
 API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
-SESSION_DIR = Path(os.environ.get("SESSION_DIR", "/tmp/relay_sessions"))
+SESSION_DIR = Path(os.environ.get("SESSION_DIR", "/data/relay_sessions"))
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 # Anti-limit configuration
@@ -104,13 +104,13 @@ async def get_client(user_id: str, account_id: str, proxy: Optional[dict] = None
 
     meta = load_meta(user_id, account_id)
     if not meta or not meta.get("string_session"):
-        raise HTTPException(401, f"Account '{account_id[:8]}' has no saved session. Delete it and re-add it via Accounts.")
+        raise HTTPException(401, f"Account '{account_id[:8]}' has no saved session (looked in {SESSION_DIR}). Delete it and re-add it via Accounts.")
 
     client = TelegramClient(StringSession(meta["string_session"]), API_ID, API_HASH, proxy=build_proxy(proxy))
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
-        raise HTTPException(401, f"Account '{meta.get('name', account_id[:8])}' was rejected by Telegram (session revoked or 2FA change). Delete it and re-add it.")
+        raise HTTPException(401, f"Account '{meta.get('name', account_id[:8])}' session was rejected by Telegram (session revoked or 2FA changed). Delete it and re-add it via Accounts.")
     clients[cache_key] = client
     return client
 
@@ -260,6 +260,22 @@ async def list_accounts(request: Request):
             "status": status,
         })
     return {"accounts": accounts}
+
+
+@app.post("/v1/accounts/sync")
+async def sync_accounts(request: Request):
+    """Check which account IDs still have valid session files on disk."""
+    user_id = verify_key(request)
+    body = await request.json()
+    account_ids = body.get("account_ids", [])
+    results = {}
+    for aid in account_ids:
+        meta = load_meta(user_id, aid)
+        if meta and meta.get("string_session"):
+            results[aid] = "ok"
+        else:
+            results[aid] = "session_lost"
+    return {"accounts": results}
 
 
 @app.post("/v1/accounts/delete")
