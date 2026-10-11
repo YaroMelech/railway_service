@@ -68,26 +68,49 @@ def user_dir(user_id: str) -> Path:
     return d
 
 
-def session_path(user_id: str, account_id: str) -> Path:
-    return user_dir(user_id) / f"{account_id}.session"
+def account_meta_path(user_id: str, account_id: str) -> Path:
+    return user_dir(user_id) / f"{account_id}.json"
+
+
+def load_meta(user_id: str, account_id: str) -> Optional[dict]:
+    p = account_meta_path(user_id, account_id)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def build_proxy(proxy: Optional[dict]):
+    if not proxy:
+        return None
+    import socks
+    scheme = socks.SOCKS5 if proxy.get("type", "socks5") == "socks5" else socks.HTTP
+    return (scheme, proxy["host"], int(proxy["port"]), True, proxy.get("user"), proxy.get("pass"))
 
 
 async def get_client(user_id: str, account_id: str, proxy: Optional[dict] = None) -> TelegramClient:
     cache_key = f"{user_id}:{account_id}"
-    if cache_key in clients and clients[cache_key].is_connected():
-        return clients[cache_key]
+    cached = clients.get(cache_key)
+    if cached and cached.is_connected() and await cached.is_user_authorized():
+        return cached
+    if cached:
+        try:
+            await cached.disconnect()
+        except Exception:
+            pass
+        clients.pop(cache_key, None)
 
-    sp = session_path(user_id, account_id)
-    proxy_tuple = None
-    if proxy:
-        import socks
-        proxy_tuple = (socks.SOCKS5, proxy["host"], proxy["port"], True, proxy.get("user"), proxy.get("pass"))
+    meta = load_meta(user_id, account_id)
+    if not meta or not meta.get("string_session"):
+        raise HTTPException(401, f"Account '{account_id[:8]}' has no saved session. Delete it and re-add it via Accounts.")
 
-    client = TelegramClient(str(sp), API_ID, API_HASH, proxy=proxy_tuple)
+    client = TelegramClient(StringSession(meta["string_session"]), API_ID, API_HASH, proxy=build_proxy(proxy))
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
-        raise HTTPException(401, f"Account {account_id} is not authorized. Re-login required.")
+        raise HTTPException(401, f"Account '{meta.get('name', account_id[:8])}' was rejected by Telegram (session revoked or 2FA change). Delete it and re-add it.")
     clients[cache_key] = client
     return client
 
@@ -127,8 +150,7 @@ async def login_start(request: Request):
 
     tmp_id = uuid.uuid4().hex[:12]
     account_id = uuid.uuid4().hex
-    sp = session_path(user_id, account_id)
-    client = TelegramClient(str(sp), API_ID, API_HASH)
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
 
     try:
@@ -177,7 +199,18 @@ async def login_complete(request: Request):
             pending["authenticated"] = True
             return {"requires_name": True}
 
-        await client.disconnect()
+        # Export StringSession (embeds auth key + correct DC) and persist meta
+        string_session = client.session.save()
+        meta = {
+            "id": account_id,
+            "name": name,
+            "username": me.username,
+            "phone_hint": f"+{me.phone[-4:]}" if me.phone else None,
+            "string_session": string_session,
+            "created_at": time.time(),
+        }
+        account_meta_path(user_id, account_id).write_text(json.dumps(meta))
+        clients[cache_key] = client  # keep connected; pending cleanup below
         pending_logins.pop(tmp_id, None)
 
         return {
@@ -204,19 +237,28 @@ async def login_complete(request: Request):
 async def list_accounts(request: Request):
     user_id = verify_key(request)
     accounts = []
-    for p in user_dir(user_id).glob("*.session"):
-        account_id = p.stem
+    for p in sorted(user_dir(user_id).glob("*.json")):
+        try:
+            meta = json.loads(p.read_text())
+        except Exception:
+            continue
+        account_id = meta.get("id", p.stem)
+        status = "disconnected"
+        username = meta.get("username")
         try:
             client = await get_client(user_id, account_id)
             me = await client.get_me()
-            accounts.append({
-                "id": account_id, "name": (me.first_name or me.username or account_id)[:20],
-                "username": me.username,
-                "phone_hint": f"+{me.phone[-4:]}" if me.phone else None,
-                "status": "connected"
-            })
+            username = me.username or username
+            status = "connected"
         except Exception:
-            accounts.append({"id": account_id, "name": account_id[:8], "username": None, "phone_hint": None, "status": "disconnected"})
+            pass
+        accounts.append({
+            "id": account_id,
+            "name": (meta.get("name") or username or account_id)[:20],
+            "username": username,
+            "phone_hint": meta.get("phone_hint"),
+            "status": status,
+        })
     return {"accounts": accounts}
 
 
@@ -227,14 +269,18 @@ async def delete_account(request: Request):
     account_id = body.get("account_id", "")
     cache_key = f"{user_id}:{account_id}"
     if cache_key in clients:
-        await clients[cache_key].disconnect()
+        try:
+            await clients[cache_key].disconnect()
+        except Exception:
+            pass
         del clients[cache_key]
-    sp = session_path(user_id, account_id)
-    if sp.exists():
-        sp.unlink()
-    journal = sp.parent / f"{sp.name}-journal"
-    if journal.exists():
-        journal.unlink()
+    meta = account_meta_path(user_id, account_id)
+    if meta.exists():
+        meta.unlink()
+    d = user_dir(user_id)
+    for legacy in (d / f"{account_id}.session", d / f"{account_id}.session-journal"):
+        if legacy.exists():
+            legacy.unlink()
     return {"ok": True}
 
 
