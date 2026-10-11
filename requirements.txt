@@ -1,0 +1,6 @@
+telethon
+cryptg
+aiohttp
+uvicorn
+fastapi
+python-multipart
