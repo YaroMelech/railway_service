@@ -11,9 +11,13 @@ from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import (
     InputPhoneContact, InputUser, ChannelParticipantsSearch,
     UserStatusRecently, UserStatusOnline, UserStatusLastWeek,
+    InputPeerChannel
+)
+from telethon.errors import (
     FloodWaitError, PeerFloodError, ChatAdminRequiredError,
     UserPrivacyRestrictedError, UserNotMutualContactError,
-    ChatWriteForbiddenError, InputPeerChannel
+    ChatWriteForbiddenError, SessionPasswordNeededError,
+    PhoneCodeInvalidError, PhoneCodeExpiredError
 )
 from telethon.sessions import StringSession
 
@@ -39,6 +43,7 @@ app = FastAPI()
 # In-memory job store (use Redis/DB in production)
 jobs: dict[str, dict] = {}
 clients: dict[str, TelegramClient] = {}
+pending_logins: dict[str, dict] = {}
 
 
 def verify_key(request: Request):
@@ -51,9 +56,15 @@ def verify_key(request: Request):
     return user_id
 
 
+def user_dir(user_id: str) -> Path:
+    safe = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+    d = SESSION_DIR / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def session_path(user_id: str, account_id: str) -> Path:
-    safe = hashlib.sha256(f"{user_id}:{account_id}".encode()).hexdigest()[:16]
-    return SESSION_DIR / f"{safe}.session"
+    return user_dir(user_id) / f"{account_id}.session"
 
 
 async def get_client(user_id: str, account_id: str, proxy: Optional[dict] = None) -> TelegramClient:
@@ -104,7 +115,7 @@ async def login_start(request: Request):
     if not phone:
         raise HTTPException(400, "Phone number required")
 
-    tmp_id = f"tmp_{hashlib.md5(phone.encode()).hexdigest()[:8]}"
+    tmp_id = uuid.uuid4().hex[:12]
     sp = session_path(user_id, tmp_id)
     client = TelegramClient(str(sp), API_ID, API_HASH)
     await client.connect()
@@ -112,6 +123,7 @@ async def login_start(request: Request):
     try:
         result = await client.send_code_request(phone)
         clients[f"{user_id}:{tmp_id}"] = client
+        pending_logins[tmp_id] = {"user_id": user_id, "phone": phone, "phone_code_hash": result.phone_code_hash}
         return {"hash": result.phone_code_hash, "tmp_id": tmp_id}
     except FloodWaitError as e:
         await client.disconnect()
@@ -125,10 +137,14 @@ async def login_start(request: Request):
 async def login_complete(request: Request):
     user_id = verify_key(request)
     body = await request.json()
-    tmp_id = body.get("hash", body.get("tmp_id", ""))
+    tmp_id = body.get("tmp_id", "")
     code = body.get("code", "")
     password = body.get("password")
     name = body.get("name", "default")
+
+    pending = pending_logins.get(tmp_id)
+    if not pending or pending["user_id"] != user_id:
+        raise HTTPException(400, "Login session expired. Start over.")
 
     cache_key = f"{user_id}:{tmp_id}"
     client = clients.get(cache_key)
@@ -136,13 +152,19 @@ async def login_complete(request: Request):
         raise HTTPException(400, "Login session expired. Start over.")
 
     try:
-        if password:
+        if pending.get("authenticated"):
+            me = await client.get_me()
+        elif password:
             await client.sign_in(password=password)
+            me = await client.get_me()
         else:
-            phone = body.get("phone", "")
-            await client.sign_in(phone=phone, code=code, phone_code_hash=tmp_id)
+            await client.sign_in(phone=pending["phone"], code=code, phone_code_hash=pending["phone_code_hash"])
+            me = await client.get_me()
 
-        me = await client.get_me()
+        if not name or name == "default":
+            pending["authenticated"] = True
+            return {"requires_name": True}
+
         account_id = str(uuid.uuid4())
         old_path = session_path(user_id, tmp_id)
         new_path = session_path(user_id, account_id)
@@ -155,6 +177,7 @@ async def login_complete(request: Request):
             journal.unlink()
 
         del clients[cache_key]
+        pending_logins.pop(tmp_id, None)
 
         return {
             "accounts": [{
@@ -165,6 +188,10 @@ async def login_complete(request: Request):
                 "status": "connected"
             }]
         }
+    except SessionPasswordNeededError:
+        return {"requires_password": True}
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+        raise HTTPException(400, f"Verification failed: {type(e).__name__}. Start over.")
     except Exception as e:
         err = str(e).lower()
         if "two-step" in err or "password" in err:
@@ -176,19 +203,19 @@ async def login_complete(request: Request):
 async def list_accounts(request: Request):
     user_id = verify_key(request)
     accounts = []
-    for p in SESSION_DIR.glob("*.session"):
-        stem = p.stem
+    for p in user_dir(user_id).glob("*.session"):
+        account_id = p.stem
         try:
-            client = await get_client(user_id, stem)
+            client = await get_client(user_id, account_id)
             me = await client.get_me()
             accounts.append({
-                "id": stem, "name": stem[:8],
+                "id": account_id, "name": (me.first_name or me.username or account_id)[:20],
                 "username": me.username,
                 "phone_hint": f"+{me.phone[-4:]}" if me.phone else None,
                 "status": "connected"
             })
         except Exception:
-            accounts.append({"id": stem, "name": stem[:8], "username": None, "phone_hint": None, "status": "disconnected"})
+            accounts.append({"id": account_id, "name": account_id[:8], "username": None, "phone_hint": None, "status": "disconnected"})
     return {"accounts": accounts}
 
 

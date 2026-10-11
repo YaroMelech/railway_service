@@ -4,3 +4,4 @@ aiohttp
 uvicorn
 fastapi
 python-multipart
+pysocks
