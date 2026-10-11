@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 from telethon import TelegramClient
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantsRequest
-from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import (
     InputPhoneContact, InputUser, ChannelParticipantsSearch,
     UserStatusRecently, UserStatusOnline, UserStatusLastWeek,
@@ -39,6 +38,12 @@ BATCH_PAUSE_MAX = float(os.environ.get("BATCH_PAUSE_MAX", "600"))
 ROTATION_THRESHOLD = int(os.environ.get("ROTATION_THRESHOLD", "20"))
 
 app = FastAPI()
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    log.exception(f"Unhandled error on {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {str(exc)[:300]}"})
 
 # In-memory job store (use Redis/DB in production)
 jobs: dict[str, dict] = {}
@@ -121,14 +126,15 @@ async def login_start(request: Request):
         raise HTTPException(400, "Phone number required")
 
     tmp_id = uuid.uuid4().hex[:12]
-    sp = session_path(user_id, tmp_id)
+    account_id = uuid.uuid4().hex
+    sp = session_path(user_id, account_id)
     client = TelegramClient(str(sp), API_ID, API_HASH)
     await client.connect()
 
     try:
         result = await client.send_code_request(phone)
-        clients[f"{user_id}:{tmp_id}"] = client
-        pending_logins[tmp_id] = {"user_id": user_id, "phone": phone, "phone_code_hash": result.phone_code_hash}
+        clients[f"{user_id}:{account_id}"] = client
+        pending_logins[tmp_id] = {"user_id": user_id, "phone": phone, "phone_code_hash": result.phone_code_hash, "account_id": account_id}
         return {"hash": result.phone_code_hash, "tmp_id": tmp_id}
     except FloodWaitError as e:
         await client.disconnect()
@@ -151,7 +157,8 @@ async def login_complete(request: Request):
     if not pending or pending["user_id"] != user_id:
         raise HTTPException(400, "Login session expired. Start over.")
 
-    cache_key = f"{user_id}:{tmp_id}"
+    account_id = pending["account_id"]
+    cache_key = f"{user_id}:{account_id}"
     client = clients.get(cache_key)
     if not client:
         raise HTTPException(400, "Login session expired. Start over.")
@@ -170,18 +177,7 @@ async def login_complete(request: Request):
             pending["authenticated"] = True
             return {"requires_name": True}
 
-        account_id = str(uuid.uuid4())
-        old_path = session_path(user_id, tmp_id)
-        new_path = session_path(user_id, account_id)
         await client.disconnect()
-
-        if old_path.exists():
-            old_path.rename(new_path)
-        journal = old_path.parent / f"{old_path.name}-journal"
-        if journal.exists():
-            journal.unlink()
-
-        del clients[cache_key]
         pending_logins.pop(tmp_id, None)
 
         return {
@@ -249,11 +245,13 @@ async def list_groups(request: Request):
     account_id = body.get("account_id", "")
     client = await get_client(user_id, account_id)
 
-    result = await client(GetDialogsRequest(offset_date=None, offset_id=0, offset_peer=None, limit=200, hash=0))
     groups = []
-    for chat in result.chats:
-        if hasattr(chat, 'megagroup') and chat.megagroup:
-            groups.append({"id": str(chat.id), "title": chat.title})
+    try:
+        async for dialog in client.iter_dialogs(limit=300):
+            if dialog.is_group or dialog.is_channel:
+                groups.append({"id": str(dialog.entity.id), "title": dialog.entity.title})
+    except FloodWaitError as e:
+        raise HTTPException(429, f"Flood wait: retry after {e.seconds}s")
     return {"groups": groups}
 
 
