@@ -246,17 +246,38 @@ async def get_client(user_id: str, account_id: str, proxy: Optional[dict] = None
     return client
 
 
-async def human_delay(min_s: float = MIN_DELAY, max_s: float = MAX_DELAY):
+def add_job_log(job: Optional[dict], level: str, message: str):
+    if not job:
+        return
+    if "logs" not in job:
+        job["logs"] = []
+    entry = {
+        "time": now_iso(),
+        "level": level,  # "info" | "success" | "delay" | "warn" | "error"
+        "message": message,
+    }
+    job["logs"].append(entry)
+    if len(job["logs"]) > 250:
+        job["logs"] = job["logs"][-250:]
+
+
+async def human_delay(job: Optional[dict] = None, min_s: float = MIN_DELAY, max_s: float = MAX_DELAY):
     delay = random.uniform(min_s, max_s)
     jitter = random.uniform(-2, 5)
     delay = max(8, delay + jitter)
-    log.info(f"Human delay: {delay:.1f}s")
+    msg = f"Human delay: waiting {delay:.1f}s before next operation..."
+    log.info(msg)
+    if job:
+        add_job_log(job, "delay", msg)
     await asyncio.sleep(delay)
 
 
-async def batch_pause():
+async def batch_pause(job: Optional[dict] = None):
     pause = random.uniform(BATCH_PAUSE_MIN, BATCH_PAUSE_MAX)
-    log.info(f"Batch pause: {pause:.0f}s")
+    msg = f"Batch pause safety threshold reached: cooling down for {pause:.0f}s..."
+    log.info(msg)
+    if job:
+        add_job_log(job, "delay", msg)
     await asyncio.sleep(pause)
 
 
@@ -487,24 +508,38 @@ async def start_job(request: Request):
     group_id = body.get("group_id", "")
     kind = body.get("kind", "scrape")
     source_job_id = body.get("source_job_id")
-    filters = body.get("filters", {})
+    filters = body.get("filters", {}) or {}
+    
+    limit = body.get("limit") or filters.get("limit")
+    parsed_limit = None
+    if limit is not None:
+        try:
+            parsed_limit = int(limit)
+            if parsed_limit <= 0:
+                parsed_limit = None
+        except (ValueError, TypeError):
+            parsed_limit = None
+    if parsed_limit:
+        filters["limit"] = parsed_limit
+
     proxy = body.get("proxy")
 
     job_id = str(uuid.uuid4())
     job = {
         "id": job_id, "user_id": user_id, "account_id": account_id,
         "kind": kind, "group_name": group_id, "status": "running",
-        "progress": 0, "total": 0, "added": 0, "skipped": 0, "failed": 0,
+        "progress": 0, "total": parsed_limit or 0, "added": 0, "skipped": 0, "failed": 0,
         "error": None, "settings": filters, "members": [],
+        "logs": [],
         "created_at": now_iso(), "completed_at": None,
         "cancelled": False
     }
     jobs[job_id] = job
 
     if kind == "scrape":
-        asyncio.create_task(run_scrape(job_id, user_id, account_id, group_id, filters, proxy))
+        asyncio.create_task(run_scrape(job_id, user_id, account_id, group_id, filters, proxy, parsed_limit))
     elif kind == "add":
-        asyncio.create_task(run_add(job_id, user_id, account_id, group_id, source_job_id, proxy))
+        asyncio.create_task(run_add(job_id, user_id, account_id, group_id, source_job_id, proxy, parsed_limit))
 
     return {"job": {k: v for k, v in job.items() if k != "members"}}
 
@@ -531,7 +566,8 @@ async def cancel_job(request: Request):
     job["cancelled"] = True
     job["status"] = "cancelled"
     job["completed_at"] = now_iso()
-    return {"ok": True}
+    add_job_log(job, "warn", "Operation cancelled by user.")
+    return {"ok": True, "job": {k: v for k, v in job.items() if k != "members"}}
 
 
 @app.post("/v1/jobs/results")
@@ -557,22 +593,43 @@ async def job_results(request: Request):
     return {"members": members}
 
 
-async def run_scrape(job_id: str, user_id: str, account_id: str, group_id: str, filters: dict, proxy: Optional[dict]):
+async def run_scrape(job_id: str, user_id: str, account_id: str, group_id: str, filters: dict, proxy: Optional[dict], limit: Optional[int] = None):
     job = jobs[job_id]
+    if limit is None:
+        raw_limit = filters.get("limit")
+        if raw_limit is not None:
+            try:
+                limit = int(raw_limit)
+                if limit <= 0:
+                    limit = None
+            except (ValueError, TypeError):
+                limit = None
+
+    limit_desc = f"{limit} members" if limit else "All members"
+    add_job_log(job, "info", f"Starting member collection for group '{group_id}' (target: {limit_desc})...")
+
     try:
         client = await get_client(user_id, account_id, proxy)
         entity = await client.get_entity(int(group_id) if group_id.lstrip("-").isdigit() else group_id)
+        group_title = getattr(entity, "title", str(group_id))
+        job["group_name"] = group_title
+        add_job_log(job, "info", f"Connected to Telegram group '{group_title}'. Fetching member roster...")
 
         offset = 0
         all_members = []
+        batch_num = 1
         while True:
             if job["cancelled"]:
+                add_job_log(job, "warn", "Collection cancelled by user.")
                 return
             participants = await client(GetParticipantsRequest(
                 channel=entity, filter=ChannelParticipantsSearch(""), offset=offset, limit=200, hash=0
             ))
             if not participants.users:
+                add_job_log(job, "info", "Reached the end of group member directory.")
                 break
+
+            matched_in_batch = 0
             for u in participants.users:
                 member = {
                     "id": str(u.id),
@@ -601,34 +658,61 @@ async def run_scrape(job_id: str, user_id: str, account_id: str, group_id: str, 
                     text = f"{member['first_name']} {member['last_name']} {u.username or ''}"
                     if not re.search(pattern, text, re.I):
                         continue
+
                 all_members.append(member)
+                matched_in_batch += 1
+
+                if limit and len(all_members) >= limit:
+                    all_members = all_members[:limit]
+                    break
+
             offset += len(participants.users)
             job["progress"] = len(all_members)
-            await asyncio.sleep(random.uniform(1, 3))
+            if limit:
+                job["total"] = limit
+            else:
+                job["total"] = max(job["total"], len(all_members))
+
+            add_job_log(
+                job,
+                "info",
+                f"Batch #{batch_num}: processed {len(participants.users)} participants ({matched_in_batch} matched filters). Total collected: {len(all_members)}{f' / {limit}' if limit else ''}."
+            )
+            batch_num += 1
+
+            if limit and len(all_members) >= limit:
+                add_job_log(job, "info", f"Target limit of {limit} members reached. Ending collection.")
+                break
+
+            await asyncio.sleep(random.uniform(1, 2.5))
 
         job["members"] = all_members
         job["total"] = len(all_members)
         job["progress"] = len(all_members)
         job["status"] = "completed"
         job["completed_at"] = now_iso()
+        add_job_log(job, "success", f"Collection successfully completed! Total members saved: {len(all_members)}.")
         log.info(f"Scrape {job_id}: {len(all_members)} members collected")
 
     except FloodWaitError as e:
         job["status"] = "failed"
         job["error"] = f"Flood wait: retry after {e.seconds}s"
         job["completed_at"] = now_iso()
+        add_job_log(job, "error", f"Telegram FloodWait encountered: must wait {e.seconds}s.")
     except ChatAdminRequiredError:
         job["status"] = "failed"
         job["error"] = "Admin access required for this group"
         job["completed_at"] = now_iso()
+        add_job_log(job, "error", "Telegram error: Admin access is required to view members of this group.")
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)[:500]
         job["completed_at"] = now_iso()
+        add_job_log(job, "error", f"Collection failed: {str(e)[:300]}")
         log.error(f"Scrape {job_id} failed: {e}")
 
 
-async def run_add(job_id: str, user_id: str, account_id: str, target_group: str, source_job_id: str, proxy: Optional[dict]):
+async def run_add(job_id: str, user_id: str, account_id: str, target_group: str, source_job_id: str, proxy: Optional[dict], limit: Optional[int] = None):
     job = jobs[job_id]
     try:
         source_job = jobs.get(source_job_id)
@@ -636,13 +720,24 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
             job["status"] = "failed"
             job["error"] = "Source collection not found or empty"
             job["completed_at"] = now_iso()
+            add_job_log(job, "error", "Source collection not found or contains 0 members.")
             return
 
-        members = source_job["members"]
+        members = list(source_job["members"])
+        if limit and limit > 0:
+            members = members[:limit]
+            add_job_log(job, "info", f"Applying custom limit: targeting {len(members)} members out of {len(source_job['members'])} available.")
+        else:
+            add_job_log(job, "info", f"Targeting all {len(members)} available members from source collection.")
+
         job["total"] = len(members)
+        add_job_log(job, "info", f"Connecting account to Telegram for target group '{target_group}'...")
 
         client = await get_client(user_id, account_id, proxy)
         entity = await client.get_entity(int(target_group) if target_group.lstrip("-").isdigit() else target_group)
+        group_title = getattr(entity, "title", str(target_group))
+        job["group_name"] = group_title
+        add_job_log(job, "info", f"Connected to group '{group_title}'. Beginning member addition sequence...")
 
         added_count = 0
         adds_since_pause = 0
@@ -650,8 +745,12 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
         for i, member in enumerate(members):
             if job["cancelled"]:
                 job["status"] = "cancelled"
-                job["completed_at"] = time.time()
+                job["completed_at"] = now_iso()
+                add_job_log(job, "warn", f"Operation cancelled by user after processing {i} members.")
                 return
+
+            member_label = f"@{member['username']}" if member.get("username") else f"{member.get('first_name', '')} {member.get('last_name', '')} (ID: {member.get('id')})".strip()
+            add_job_log(job, "info", f"[{i + 1}/{len(members)}] Inviting {member_label}...")
 
             try:
                 # Strategy 4: Use ID + AccessHash for direct matching
@@ -667,8 +766,8 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                 contact = InputPhoneContact(
                     client_id=random.randint(100000, 999999),
                     phone=f"+{random.randint(1000000000, 9999999999)}",
-                    first_name=member.get("first_name", "User"),
-                    last_name=member.get("last_name", "")
+                    first_name=member.get("first_name", "User") or "User",
+                    last_name=member.get("last_name", "") or ""
                 )
 
                 # Try direct invite first (uses AccessHash — lower friction)
@@ -676,8 +775,10 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                     await client(InviteToChannelRequest(channel=entity, users=[input_user]))
                     added_count += 1
                     job["added"] = added_count
+                    add_job_log(job, "success", f"Successfully added {member_label} directly! (Total added: {added_count})")
                 except (UserNotMutualContactError, UserPrivacyRestrictedError):
                     # Fall back to contact-add trick
+                    add_job_log(job, "warn", f"{member_label} has privacy restrictions. Attempting contact bypass...")
                     try:
                         import_result = await client(ImportContactsRequest([contact]))
                         if import_result.imported:
@@ -686,14 +787,18 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                             await client(DeleteContactsRequest(id=[imported_user]))
                             added_count += 1
                             job["added"] = added_count
+                            add_job_log(job, "success", f"Successfully added {member_label} via contact bypass! (Total added: {added_count})")
                         else:
                             job["skipped"] += 1
-                    except Exception:
+                            add_job_log(job, "warn", f"Skipped {member_label}: privacy settings prohibit group invites.")
+                    except Exception as exc:
                         job["skipped"] += 1
+                        add_job_log(job, "warn", f"Skipped {member_label}: {str(exc)[:120]}")
                 except ChatWriteForbiddenError:
                     job["status"] = "failed"
                     job["error"] = "Cannot write to this group. Check admin permissions."
                     job["completed_at"] = now_iso()
+                    add_job_log(job, "error", "Fatal error: Admin permissions required to invite members to this group.")
                     return
 
                 adds_since_pause += 1
@@ -701,39 +806,44 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
 
                 # Strategy 1: Rotation threshold — stop and signal rotation needed
                 if adds_since_pause >= ROTATION_THRESHOLD:
-                    log.info(f"Rotation threshold reached ({ROTATION_THRESHOLD}). Pausing for account rotation.")
-                    await batch_pause()
+                    await batch_pause(job)
                     adds_since_pause = 0
 
                 # Strategy 2: Human-like micro-delay with jitter
-                await human_delay()
+                await human_delay(job)
 
             except PeerFloodError as e:
                 job["status"] = "failed"
                 job["error"] = f"Peer flood: account restricted. Wait {getattr(e, 'seconds', '?')}s before retrying."
                 job["completed_at"] = now_iso()
+                add_job_log(job, "error", f"Telegram PeerFlood restriction: account temporarily throttled by Telegram.")
                 log.warning(f"PeerFlood on job {job_id} after {added_count} adds")
                 return
             except FloodWaitError as e:
+                add_job_log(job, "warn", f"Telegram FloodWait: pausing for {e.seconds + 5}s before resuming...")
                 log.info(f"FloodWait {e.seconds}s on job {job_id}, sleeping...")
                 await asyncio.sleep(e.seconds + 5)
                 continue
             except (UserPrivacyRestrictedError, ChatWriteForbiddenError):
                 job["skipped"] += 1
+                add_job_log(job, "warn", f"Skipped {member_label} due to permission restrictions.")
                 continue
             except Exception as e:
                 job["failed"] += 1
+                add_job_log(job, "error", f"Failed to add {member_label}: {str(e)[:150]}")
                 log.warning(f"Add failed for {member.get('username', member['id'])}: {e}")
                 continue
 
         job["status"] = "completed"
         job["completed_at"] = now_iso()
+        add_job_log(job, "success", f"Operation finished! Summary: {added_count} added, {job['skipped']} skipped, {job['failed']} failed out of {len(members)} targeted.")
         log.info(f"Add {job_id}: {added_count} added, {job['skipped']} skipped, {job['failed']} failed")
 
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)[:500]
         job["completed_at"] = now_iso()
+        add_job_log(job, "error", f"Operation encountered an unexpected error: {str(e)[:300]}")
         log.error(f"Add {job_id} failed: {e}")
 
 
