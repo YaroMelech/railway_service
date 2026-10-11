@@ -1,6 +1,11 @@
 import os, json, uuid, time, asyncio, random, hashlib, logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -491,7 +496,7 @@ async def start_job(request: Request):
         "kind": kind, "group_name": group_id, "status": "running",
         "progress": 0, "total": 0, "added": 0, "skipped": 0, "failed": 0,
         "error": None, "settings": filters, "members": [],
-        "created_at": time.time(), "completed_at": None,
+        "created_at": now_iso(), "completed_at": None,
         "cancelled": False
     }
     jobs[job_id] = job
@@ -525,7 +530,7 @@ async def cancel_job(request: Request):
         raise HTTPException(404, "Job not found")
     job["cancelled"] = True
     job["status"] = "cancelled"
-    job["completed_at"] = time.time()
+    job["completed_at"] = now_iso()
     return {"ok": True}
 
 
@@ -605,21 +610,21 @@ async def run_scrape(job_id: str, user_id: str, account_id: str, group_id: str, 
         job["total"] = len(all_members)
         job["progress"] = len(all_members)
         job["status"] = "completed"
-        job["completed_at"] = time.time()
+        job["completed_at"] = now_iso()
         log.info(f"Scrape {job_id}: {len(all_members)} members collected")
 
     except FloodWaitError as e:
         job["status"] = "failed"
         job["error"] = f"Flood wait: retry after {e.seconds}s"
-        job["completed_at"] = time.time()
+        job["completed_at"] = now_iso()
     except ChatAdminRequiredError:
         job["status"] = "failed"
         job["error"] = "Admin access required for this group"
-        job["completed_at"] = time.time()
+        job["completed_at"] = now_iso()
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)[:500]
-        job["completed_at"] = time.time()
+        job["completed_at"] = now_iso()
         log.error(f"Scrape {job_id} failed: {e}")
 
 
@@ -630,7 +635,7 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
         if not source_job or not source_job.get("members"):
             job["status"] = "failed"
             job["error"] = "Source collection not found or empty"
-            job["completed_at"] = time.time()
+            job["completed_at"] = now_iso()
             return
 
         members = source_job["members"]
@@ -688,7 +693,7 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                 except ChatWriteForbiddenError:
                     job["status"] = "failed"
                     job["error"] = "Cannot write to this group. Check admin permissions."
-                    job["completed_at"] = time.time()
+                    job["completed_at"] = now_iso()
                     return
 
                 adds_since_pause += 1
@@ -706,7 +711,7 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
             except PeerFloodError as e:
                 job["status"] = "failed"
                 job["error"] = f"Peer flood: account restricted. Wait {getattr(e, 'seconds', '?')}s before retrying."
-                job["completed_at"] = time.time()
+                job["completed_at"] = now_iso()
                 log.warning(f"PeerFlood on job {job_id} after {added_count} adds")
                 return
             except FloodWaitError as e:
@@ -722,13 +727,13 @@ async def run_add(job_id: str, user_id: str, account_id: str, target_group: str,
                 continue
 
         job["status"] = "completed"
-        job["completed_at"] = time.time()
+        job["completed_at"] = now_iso()
         log.info(f"Add {job_id}: {added_count} added, {job['skipped']} skipped, {job['failed']} failed")
 
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)[:500]
-        job["completed_at"] = time.time()
+        job["completed_at"] = now_iso()
         log.error(f"Add {job_id} failed: {e}")
 
 
