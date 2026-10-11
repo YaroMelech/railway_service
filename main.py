@@ -26,8 +26,58 @@ log = logging.getLogger("relay")
 SERVICE_KEY = os.environ.get("SERVICE_KEY", "change-me-in-production")
 API_ID = int(os.environ.get("API_ID", "2040"))
 API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
-SESSION_DIR = Path(os.environ.get("SESSION_DIR", "/data/relay_sessions"))
-SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+# Robust persistent volume auto-detection
+def _init_session_dirs() -> tuple[Path, list[Path]]:
+    candidates: list[Path] = []
+    # 1. Explicit env var
+    env_dir = os.environ.get("SESSION_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    # 2. Check /proc/mounts for Railway/Docker attached volumes
+    try:
+        if Path("/proc/mounts").exists():
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        mp = parts[1]
+                        if mp in ("/", "/etc", "/dev", "/sys", "/proc", "/run", "/tmp", "/var", "/etc/hosts", "/etc/resolv.conf", "/etc/hostname"):
+                            continue
+                        if mp.startswith(("/dev", "/sys", "/proc", "/etc", "/run")):
+                            continue
+                        candidates.append(Path(mp) / "relay_sessions")
+    except Exception as e:
+        log.warning(f"Could not inspect /proc/mounts: {e}")
+    # 3. Known Railway defaults
+    for fallback in [Path("/data/relay_sessions"), Path("/app/data/relay_sessions"), Path("/data"), Path("/tmp/relay_sessions")]:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    writable_dirs: list[Path] = []
+    primary: Optional[Path] = None
+    for c in candidates:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            test_file = c / ".mount_test"
+            test_file.write_text("ok")
+            test_file.unlink()
+            if primary is None:
+                primary = c
+            if c not in writable_dirs:
+                writable_dirs.append(c)
+        except Exception:
+            pass
+
+    if primary is None:
+        primary = Path("/tmp/relay_sessions")
+        primary.mkdir(parents=True, exist_ok=True)
+        writable_dirs.append(primary)
+
+    return primary, writable_dirs
+
+SESSION_DIR, ALL_SESSION_DIRS = _init_session_dirs()
+log.info(f"Initialized SESSION_DIR: {SESSION_DIR} (all search dirs: {[str(d) for d in ALL_SESSION_DIRS]})")
 
 # Anti-limit configuration
 MIN_DELAY = float(os.environ.get("MIN_DELAY", "30"))
@@ -61,6 +111,40 @@ def verify_key(request: Request):
     return user_id
 
 
+def id_variants(account_id: str) -> list[str]:
+    """Return all representations of an account ID: canonical UUID (with hyphens), clean hex (no hyphens), and raw."""
+    if not account_id:
+        return []
+    raw = str(account_id).strip()
+    variants = [raw]
+    try:
+        u = uuid.UUID(raw)
+        canonical = str(u)
+        clean_hex = u.hex
+        if canonical not in variants:
+            variants.append(canonical)
+        if clean_hex not in variants:
+            variants.append(clean_hex)
+    except Exception:
+        no_hyphens = raw.replace("-", "").lower()
+        if no_hyphens not in variants:
+            variants.append(no_hyphens)
+    return variants
+
+
+def get_candidate_meta_paths(user_id: str, account_id: str) -> list[Path]:
+    safe = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+    paths: list[Path] = []
+    variants = id_variants(account_id)
+    for base in ALL_SESSION_DIRS:
+        user_folder = base / safe
+        for var in variants:
+            p = user_folder / f"{var}.json"
+            if p not in paths:
+                paths.append(p)
+    return paths
+
+
 def user_dir(user_id: str) -> Path:
     safe = hashlib.sha256(user_id.encode()).hexdigest()[:16]
     d = SESSION_DIR / safe
@@ -69,17 +153,60 @@ def user_dir(user_id: str) -> Path:
 
 
 def account_meta_path(user_id: str, account_id: str) -> Path:
-    return user_dir(user_id) / f"{account_id}.json"
+    # Return existing candidate if one exists, otherwise default to primary
+    for p in get_candidate_meta_paths(user_id, account_id):
+        if p.exists():
+            return p
+    # Default to canonical format
+    try:
+        canonical = str(uuid.UUID(str(account_id).strip()))
+        return user_dir(user_id) / f"{canonical}.json"
+    except Exception:
+        return user_dir(user_id) / f"{account_id}.json"
 
 
 def load_meta(user_id: str, account_id: str) -> Optional[dict]:
-    p = account_meta_path(user_id, account_id)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+    for p in get_candidate_meta_paths(user_id, account_id):
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+                if data.get("string_session"):
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def save_meta(user_id: str, account_id: str, meta: dict):
+    safe = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+    content = json.dumps(meta)
+    variants = id_variants(account_id)
+    for base in ALL_SESSION_DIRS:
+        try:
+            folder = base / safe
+            folder.mkdir(parents=True, exist_ok=True)
+            for var in variants:
+                (folder / f"{var}.json").write_text(content)
+        except Exception as e:
+            log.warning(f"Could not save meta to {base}: {e}")
+
+
+def get_cached_client(user_id: str, account_id: str) -> Optional[TelegramClient]:
+    for var in id_variants(account_id):
+        c = clients.get(f"{user_id}:{var}")
+        if c:
+            return c
+    return None
+
+
+def set_cached_client(user_id: str, account_id: str, client: TelegramClient):
+    for var in id_variants(account_id):
+        clients[f"{user_id}:{var}"] = client
+
+
+def remove_cached_client(user_id: str, account_id: str):
+    for var in id_variants(account_id):
+        clients.pop(f"{user_id}:{var}", None)
 
 
 def build_proxy(proxy: Optional[dict]):
@@ -91,8 +218,7 @@ def build_proxy(proxy: Optional[dict]):
 
 
 async def get_client(user_id: str, account_id: str, proxy: Optional[dict] = None) -> TelegramClient:
-    cache_key = f"{user_id}:{account_id}"
-    cached = clients.get(cache_key)
+    cached = get_cached_client(user_id, account_id)
     if cached and cached.is_connected() and await cached.is_user_authorized():
         return cached
     if cached:
@@ -100,18 +226,18 @@ async def get_client(user_id: str, account_id: str, proxy: Optional[dict] = None
             await cached.disconnect()
         except Exception:
             pass
-        clients.pop(cache_key, None)
+        remove_cached_client(user_id, account_id)
 
     meta = load_meta(user_id, account_id)
     if not meta or not meta.get("string_session"):
-        raise HTTPException(401, f"Account '{account_id[:8]}' has no saved session (looked in {SESSION_DIR}). Delete it and re-add it via Accounts.")
+        raise HTTPException(401, f"Account '{str(account_id)[:8]}' has no saved session (searched in {SESSION_DIR}). Delete it and re-add it via Accounts.")
 
     client = TelegramClient(StringSession(meta["string_session"]), API_ID, API_HASH, proxy=build_proxy(proxy))
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
-        raise HTTPException(401, f"Account '{meta.get('name', account_id[:8])}' session was rejected by Telegram (session revoked or 2FA changed). Delete it and re-add it via Accounts.")
-    clients[cache_key] = client
+        raise HTTPException(401, f"Account '{meta.get('name', str(account_id)[:8])}' session was rejected by Telegram (session revoked or 2FA changed). Delete it and re-add it via Accounts.")
+    set_cached_client(user_id, account_id, client)
     return client
 
 
@@ -149,13 +275,14 @@ async def login_start(request: Request):
         raise HTTPException(400, "Phone number required")
 
     tmp_id = uuid.uuid4().hex[:12]
-    account_id = uuid.uuid4().hex
+    # Standard canonical UUID with hyphens matching PostgreSQL / Supabase
+    account_id = str(uuid.uuid4())
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
 
     try:
         result = await client.send_code_request(phone)
-        clients[f"{user_id}:{account_id}"] = client
+        set_cached_client(user_id, account_id, client)
         pending_logins[tmp_id] = {"user_id": user_id, "phone": phone, "phone_code_hash": result.phone_code_hash, "account_id": account_id}
         return {"hash": result.phone_code_hash, "tmp_id": tmp_id}
     except FloodWaitError as e:
@@ -180,8 +307,7 @@ async def login_complete(request: Request):
         raise HTTPException(400, "Login session expired. Start over.")
 
     account_id = pending["account_id"]
-    cache_key = f"{user_id}:{account_id}"
-    client = clients.get(cache_key)
+    client = get_cached_client(user_id, account_id)
     if not client:
         raise HTTPException(400, "Login session expired. Start over.")
 
@@ -209,8 +335,8 @@ async def login_complete(request: Request):
             "string_session": string_session,
             "created_at": time.time(),
         }
-        account_meta_path(user_id, account_id).write_text(json.dumps(meta))
-        clients[cache_key] = client  # keep connected; pending cleanup below
+        save_meta(user_id, account_id, meta)
+        set_cached_client(user_id, account_id, client)  # keep connected
         pending_logins.pop(tmp_id, None)
 
         return {
@@ -237,39 +363,60 @@ async def login_complete(request: Request):
 async def list_accounts(request: Request):
     user_id = verify_key(request)
     accounts = []
-    for p in sorted(user_dir(user_id).glob("*.json")):
-        try:
-            meta = json.loads(p.read_text())
-        except Exception:
+    seen_ids = set()
+    safe = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+
+    for base in ALL_SESSION_DIRS:
+        ud = base / safe
+        if not ud.exists():
             continue
-        account_id = meta.get("id", p.stem)
-        status = "disconnected"
-        username = meta.get("username")
-        try:
-            client = await get_client(user_id, account_id)
-            me = await client.get_me()
-            username = me.username or username
-            status = "connected"
-        except Exception:
-            pass
-        accounts.append({
-            "id": account_id,
-            "name": (meta.get("name") or username or account_id)[:20],
-            "username": username,
-            "phone_hint": meta.get("phone_hint"),
-            "status": status,
-        })
+        for p in sorted(ud.glob("*.json")):
+            try:
+                meta = json.loads(p.read_text())
+            except Exception:
+                continue
+            account_id = meta.get("id") or p.stem
+            try:
+                account_id = str(uuid.UUID(str(account_id).strip()))
+            except Exception:
+                pass
+            if account_id in seen_ids:
+                continue
+            seen_ids.add(account_id)
+
+            status = "disconnected"
+            username = meta.get("username")
+            try:
+                client = await get_client(user_id, account_id)
+                me = await client.get_me()
+                username = me.username or username
+                status = "connected"
+            except Exception:
+                pass
+            accounts.append({
+                "id": account_id,
+                "name": (meta.get("name") or username or account_id)[:20],
+                "username": username,
+                "phone_hint": meta.get("phone_hint"),
+                "status": status,
+            })
     return {"accounts": accounts}
 
 
 @app.post("/v1/accounts/sync")
 async def sync_accounts(request: Request):
-    """Check which account IDs still have valid session files on disk."""
+    """Check which account IDs still have valid session files on disk or live in memory."""
     user_id = verify_key(request)
     body = await request.json()
     account_ids = body.get("account_ids", [])
     results = {}
     for aid in account_ids:
+        # First check in-memory client
+        c = get_cached_client(user_id, aid)
+        if c and c.is_connected():
+            results[aid] = "ok"
+            continue
+        # Then check disk meta across all dirs and ID variants
         meta = load_meta(user_id, aid)
         if meta and meta.get("string_session"):
             results[aid] = "ok"
@@ -283,20 +430,30 @@ async def delete_account(request: Request):
     user_id = verify_key(request)
     body = await request.json()
     account_id = body.get("account_id", "")
-    cache_key = f"{user_id}:{account_id}"
-    if cache_key in clients:
+    cached = get_cached_client(user_id, account_id)
+    if cached:
         try:
-            await clients[cache_key].disconnect()
+            await cached.disconnect()
         except Exception:
             pass
-        del clients[cache_key]
-    meta = account_meta_path(user_id, account_id)
-    if meta.exists():
-        meta.unlink()
-    d = user_dir(user_id)
-    for legacy in (d / f"{account_id}.session", d / f"{account_id}.session-journal"):
-        if legacy.exists():
-            legacy.unlink()
+    remove_cached_client(user_id, account_id)
+
+    safe = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+    for p in get_candidate_meta_paths(user_id, account_id):
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    for base in ALL_SESSION_DIRS:
+        ud = base / safe
+        for var in id_variants(account_id):
+            for legacy in (ud / f"{var}.session", ud / f"{var}.session-journal"):
+                if legacy.exists():
+                    try:
+                        legacy.unlink()
+                    except Exception:
+                        pass
     return {"ok": True}
 
 
